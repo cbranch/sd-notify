@@ -64,6 +64,10 @@ pub enum NotifyState<'a> {
     ExtendTimeoutUsec(u32),
     /// Tells the service manager to store attached file descriptors.
     FdStore,
+    /// Tells the service manager to remove stored file descriptors.
+    FdStoreRemove,
+    /// Tells the service manager to use this name for the attached file descriptor.
+    FdName(&'a str),
     /// Custom state.
     Custom(&'a str),
 }
@@ -83,6 +87,8 @@ impl Display for NotifyState<'_> {
             NotifyState::WatchdogUsec(usec) => write!(f, "WATCHDOG_USEC={}", usec),
             NotifyState::ExtendTimeoutUsec(usec) => write!(f, "EXTEND_TIMEOUT_USEC={}", usec),
             NotifyState::FdStore => write!(f, "FDSTORE=1"),
+            NotifyState::FdStoreRemove => write!(f, "FDSTOREREMOVE=1"),
+            NotifyState::FdName(name) => write!(f, "FDNAME={}", name),
             NotifyState::Custom(state) => write!(f, "{}", state),
         }
     }
@@ -206,17 +212,23 @@ pub fn notify_with_fds(
 /// ```no_run
 /// let socket = sd_notify::listen_fds().map(|mut fds| fds.next().expect("missing fd"));
 /// ```
-pub fn listen_fds() -> io::Result<impl Iterator<Item = RawFd>> {
-    struct Guard;
+pub fn listen_fds() -> io::Result<impl ExactSizeIterator<Item = RawFd>> {
+    listen_fds_internal(true)
+}
+
+fn listen_fds_internal(unset_env: bool) -> io::Result<impl ExactSizeIterator<Item = RawFd>> {
+    struct Guard(bool);
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            env::remove_var("LISTEN_PID");
-            env::remove_var("LISTEN_FDS");
+            if self.0 {
+                env::remove_var("LISTEN_PID");
+                env::remove_var("LISTEN_FDS");
+            }
         }
     }
 
-    let _guard = Guard;
+    let _guard = Guard(unset_env);
 
     let listen_pid = if let Ok(pid) = env::var("LISTEN_PID") {
         pid
@@ -252,6 +264,71 @@ pub fn listen_fds() -> io::Result<impl Iterator<Item = RawFd>> {
     let last = RawFd::try_from(last).map_err(|_| overflow())?;
     let listen_fds = SD_LISTEN_FDS_START as RawFd..last;
     Ok(listen_fds)
+}
+
+/// Checks for file descriptors passed by the service manager for socket
+/// activation.
+///
+/// The function returns an iterator over file descriptors, starting from
+/// `SD_LISTEN_FDS_START`. The number of descriptors is obtained from the
+/// `LISTEN_FDS` environment variable.
+///
+/// If the `unset_env` parameter is set, the `LISTEN_PID`, `LISTEN_FDS` and
+/// `LISTEN_FDNAMES` environment variable will be unset before returning.
+/// Child processes will not see the fdnames passed to this process. This is
+/// usually not necessary, as a process should only use the `LISTEN_FDS`
+/// variable if it is the PID given in `LISTEN_PID`.
+///
+/// Before returning, the file descriptors are set as `O_CLOEXEC`.
+///
+/// See [`sd_listen_fds_with_names(3)`][sd_listen_fds_with_names] for details.
+///
+/// [sd_listen_fds_with_names]: https://www.freedesktop.org/software/systemd/man/sd_listen_fds.html
+///
+/// # Example
+///
+/// ```no_run
+/// let socket = sd_notify::listen_fds().map(|mut fds| fds.next().expect("missing fd"));
+/// ```
+pub fn listen_fds_with_names(
+    unset_env: bool,
+) -> io::Result<impl ExactSizeIterator<Item = (RawFd, String)>> {
+    zip_fds_with_names(listen_fds_internal(unset_env)?, unset_env)
+}
+
+/// Internal helper that is independent of listen_fds function, for testing purposes.
+fn zip_fds_with_names(
+    listen_fds: impl ExactSizeIterator<Item = RawFd>,
+    unset_env: bool,
+) -> io::Result<impl ExactSizeIterator<Item = (RawFd, String)>> {
+    struct Guard(bool);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.0 {
+                env::remove_var("LISTEN_FDNAMES");
+            }
+        }
+    }
+
+    let _guard = Guard(unset_env);
+
+    let listen_fdnames = if let Ok(names) = env::var("LISTEN_FDNAMES") {
+        names.split(':').map(|x| x.to_owned()).collect::<Vec<_>>()
+    } else {
+        let mut names = vec![];
+        names.resize(listen_fds.len(), "unknown".to_string());
+        names
+    };
+
+    if listen_fdnames.len() == listen_fds.len() {
+        Ok(listen_fds.zip(listen_fdnames.into_iter()))
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid LISTEN_FDNAMES",
+        ))
+    }
 }
 
 fn fd_cloexec(fd: u32) -> io::Result<()> {
@@ -326,6 +403,7 @@ mod tests {
     use super::NotifyState;
     use std::env;
     use std::fs;
+    use std::os::fd::RawFd;
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
     use std::process;
@@ -396,6 +474,56 @@ mod tests {
         assert!(super::listen_fds().is_err());
         assert!(env::var_os("LISTEN_PID").is_none());
         assert!(env::var_os("LISTEN_FDS").is_none());
+    }
+
+    #[test]
+    fn listen_fds_with_names() {
+        env::set_var("LISTEN_FDNAMES", "omelette");
+        assert_eq!(
+            super::zip_fds_with_names(3 as RawFd..4 as RawFd)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![(3 as RawFd, "omelette".to_string())]
+        );
+        assert!(env::var_os("LISTEN_FDNAMES").is_none());
+
+        env::set_var("LISTEN_FDNAMES", "omelette:baguette");
+        assert_eq!(
+            super::zip_fds_with_names(3 as RawFd..5 as RawFd)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![
+                (3 as RawFd, "omelette".to_string()),
+                (4 as RawFd, "baguette".to_string())
+            ]
+        );
+        assert!(env::var_os("LISTEN_FDNAMES").is_none());
+
+        // LISTEN_FDNAMES is cleared
+        assert_eq!(
+            super::zip_fds_with_names(3 as RawFd..4 as RawFd)
+                .unwrap()
+                .next(),
+            Some((3 as RawFd, "unknown".to_string()))
+        );
+        assert!(env::var_os("LISTEN_FDNAMES").is_none());
+
+        // LISTEN_FDNAMES is cleared, every fd should have the name "unknown"
+        assert_eq!(
+            super::zip_fds_with_names(3 as RawFd..5 as RawFd)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![
+                (3 as RawFd, "unknown".to_string()),
+                (4 as RawFd, "unknown".to_string())
+            ],
+        );
+        assert!(env::var_os("LISTEN_FDNAMES").is_none());
+
+        // Raise an error if LISTEN_FDNAMES has a different number of entries as fds
+        env::set_var("LISTEN_FDNAMES", "omelette:baguette");
+        assert!(super::zip_fds_with_names(3 as RawFd..6 as RawFd).is_err());
+        assert!(env::var_os("LISTEN_FDNAMES").is_none());
     }
 
     #[test]
