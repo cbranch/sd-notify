@@ -27,10 +27,13 @@ use std::env;
 use std::fmt::{self, Display, Formatter, Write};
 use std::fs;
 use std::io::{self, ErrorKind};
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixDatagram;
 use std::process;
 use std::str::FromStr;
+
+use sendfd::SendWithFd;
 
 mod ffi;
 
@@ -59,6 +62,8 @@ pub enum NotifyState<'a> {
     WatchdogUsec(u32),
     /// Tells the service manager to extend the service timeout.
     ExtendTimeoutUsec(u32),
+    /// Tells the service manager to store attached file descriptors.
+    FdStore,
     /// Custom state.
     Custom(&'a str),
 }
@@ -77,6 +82,7 @@ impl Display for NotifyState<'_> {
             NotifyState::WatchdogTrigger => write!(f, "WATCHDOG=trigger"),
             NotifyState::WatchdogUsec(usec) => write!(f, "WATCHDOG_USEC={}", usec),
             NotifyState::ExtendTimeoutUsec(usec) => write!(f, "EXTEND_TIMEOUT_USEC={}", usec),
+            NotifyState::FdStore => write!(f, "FDSTORE=1"),
             NotifyState::Custom(state) => write!(f, "{}", state),
         }
     }
@@ -110,9 +116,11 @@ pub fn booted() -> io::Result<bool> {
 /// # Limitations
 ///
 /// The implementation of this function is somewhat naive: it doesn't support
-/// sending notifications on behalf of other processes, doesn't pass file
-/// descriptors, doesn't send credentials, and does not increase the send
-/// buffer size. It's still useful, though, in usual situations.
+/// sending notifications on behalf of other processes, doesn't send credentials,
+/// and does not increase the send buffer size. It's still useful, though, in
+/// usual situations.
+///
+/// If you wish to send file descriptors, use the `notify_with_fds` function.
 ///
 /// # Example
 ///
@@ -122,6 +130,42 @@ pub fn booted() -> io::Result<bool> {
 /// let _ = sd_notify::notify(true, &[NotifyState::Ready]);
 /// ```
 pub fn notify(unset_env: bool, state: &[NotifyState]) -> io::Result<()> {
+    notify_with_fds(unset_env, state, &[])
+}
+
+/// Sends the service manager a list of state changes with file descriptors.
+///
+/// If the `unset_env` parameter is set, the `NOTIFY_SOCKET` environment variable
+/// will be unset before returning. Further calls to `sd_notify` will fail, but
+/// child processes will no longer inherit the variable.
+///
+/// The notification mechanism involves sending a datagram to a Unix domain socket.
+/// See [`sd_pid_notify_with_fds(3)`][sd_pid_notify_with_fds] for details.
+///
+/// [sd_pid_notify_with_fds]: https://www.freedesktop.org/software/systemd/man/sd_notify.html
+///
+/// # Limitations
+///
+/// The implementation of this function is somewhat naive: it doesn't support
+/// sending notifications on behalf of other processes, doesn't send credentials,
+/// and does not increase the send buffer size. It's still useful, though, in
+/// usual situations.
+///
+/// # Example
+///
+/// ```no_run
+/// # use sd_notify::NotifyState;
+/// # use std::os::fd::BorrowedFd;
+/// #
+/// # let fd = unsafe { BorrowedFd::borrow_raw(0) };
+/// #
+/// let _ = sd_notify::notify_with_fds(false, &[NotifyState::FdStore], &[fd]);
+/// ```
+pub fn notify_with_fds(
+    unset_env: bool,
+    state: &[NotifyState],
+    fds: &[BorrowedFd<'_>],
+) -> io::Result<()> {
     let socket_path = match env::var_os("NOTIFY_SOCKET") {
         Some(path) => path,
         None => return Ok(()),
@@ -132,10 +176,11 @@ pub fn notify(unset_env: bool, state: &[NotifyState]) -> io::Result<()> {
 
     let mut msg = String::new();
     let sock = UnixDatagram::unbound()?;
+    sock.connect(socket_path)?;
     for s in state {
         let _ = writeln!(msg, "{}", s);
     }
-    let len = sock.send_to(msg.as_bytes(), socket_path)?;
+    let len = sock.send_with_borrowed_fd(msg.as_bytes(), fds)?;
     if len != msg.len() {
         Err(io::Error::new(ErrorKind::WriteZero, "incomplete write"))
     } else {
